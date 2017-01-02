@@ -46,6 +46,7 @@ import org.wso2.carbon.identity.oauth.tokenprocessor.PlainTextPersistenceProcess
 import org.wso2.carbon.identity.oauth.tokenprocessor.TokenPersistenceProcessor;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
 import org.wso2.carbon.identity.oauth2.authz.handlers.ResponseTypeHandler;
+import org.wso2.carbon.identity.oauth2.issuers.ScopesIssuer;
 import org.wso2.carbon.identity.oauth2.token.OauthTokenIssuer;
 import org.wso2.carbon.identity.oauth2.token.OauthTokenIssuerImpl;
 import org.wso2.carbon.identity.oauth2.token.handlers.clientauth.ClientAuthenticationHandler;
@@ -135,6 +136,7 @@ public class OAuthServerConfiguration {
     private String saml2TokenCallbackHandlerName = null;
     private SAML2TokenCallbackHandler saml2TokenCallbackHandler = null;
     private Map<String, String> tokenValidatorClassNames = new HashMap();
+    private Map<String, ScopesIssuer> scopesIssuers = new HashMap();
     private boolean isAuthContextTokGenEnabled = false;
     private String tokenGeneratorImplClass = "org.wso2.carbon.identity.oauth2.token.JWTTokenGenerator";
     private String claimsRetrieverImplClass = "org.wso2.carbon.identity.oauth2.token.DefaultClaimsRetriever";
@@ -159,11 +161,13 @@ public class OAuthServerConfiguration {
     private String openIDConnectUserInfoEndpointRequestValidator = "org.wso2.carbon.identity.oauth.endpoint.user.impl.UserInforRequestDefaultValidator";
     private String openIDConnectUserInfoEndpointAccessTokenValidator = "org.wso2.carbon.identity.oauth.endpoint.user.impl.UserInfoISAccessTokenValidator";
     private String openIDConnectUserInfoEndpointResponseBuilder = "org.wso2.carbon.identity.oauth.endpoint.user.impl.UserInfoJSONResponseBuilder";
-    private OAuth2ScopeValidator oAuth2ScopeValidator;
+    private Map<String, OAuth2ScopeValidator> oAuth2ScopeValidators;
     // property added to fix IDENTITY-4492 in backward compatible manner
     private boolean isJWTSignedWithSPKey = false;
     // property added to fix IDENTITY-4534 in backward compatible manner
     private boolean isImplicitErrorFragment = true;
+
+    private String DEFAULT_PREFIX = "default";
 
     private OAuthServerConfiguration() {
         buildOAuthServerConfiguration();
@@ -199,11 +203,18 @@ public class OAuthServerConfiguration {
         parseTokenValidators(oauthElem.getFirstChildWithName(
                 getQNameWithIdentityNS(ConfigElements.TOKEN_VALIDATORS)));
 
-        // Get the configured scope validator
+        // Get the configured scope validators
         OMElement scopeValidatorElem = oauthElem.getFirstChildWithName(
-                getQNameWithIdentityNS(ConfigElements.SCOPE_VALIDATOR));
+                getQNameWithIdentityNS(ConfigElements.SCOPE_VALIDATORS));
         if (scopeValidatorElem != null) {
-            parseScopeValidator(scopeValidatorElem);
+            parseScopeValidators(scopeValidatorElem);
+        }
+
+        // Get the configured scope validators
+        OMElement scopesIssuerElem = oauthElem.getFirstChildWithName(
+                getQNameWithIdentityNS(ConfigElements.SCOPES_ISSUERS));
+        if (scopesIssuerElem != null) {
+            parseScopeIssuers(scopesIssuerElem);
         }
 
         // read default timeout periods
@@ -862,26 +873,93 @@ public class OAuthServerConfiguration {
         }
     }
 
-    private void parseScopeValidator(OMElement scopeValidatorElem) {
-
-        String scopeValidatorClazz = scopeValidatorElem.getAttributeValue(new QName(ConfigElements.SCOPE_CLASS_ATTR));
-
-        String scopesToSkipAttr = scopeValidatorElem.getAttributeValue(new QName(ConfigElements.SKIP_SCOPE_ATTR));
+    private void parseScopeValidators(OMElement scopeValidatorElem) {
+        oAuth2ScopeValidators = new HashMap<>();
+        String scopeValidatorClazz = null;
+        String scopesToSkipAttr;
+        String prefix;
+        Class clazz;
+        OAuth2ScopeValidator scopeValidator;
+        Set<String> scopesToSkip;
         try {
-            Class clazz = Thread.currentThread().getContextClassLoader().loadClass(scopeValidatorClazz);
-            OAuth2ScopeValidator scopeValidator = (OAuth2ScopeValidator) clazz.newInstance();
-            if (scopesToSkipAttr != null && !"".equals(scopesToSkipAttr)) {
-                //Split the scopes attr by a -space- character and create the set (avoid duplicates).
-                Set<String> scopesToSkip = new HashSet<String>(Arrays.asList(scopesToSkipAttr.split(" ")));
-                scopeValidator.setScopesToSkip(scopesToSkip);
+            Iterator validators = scopeValidatorElem.getChildrenWithLocalName(ConfigElements.SCOPE_VALIDATOR);
+            if (validators != null) {
+
+                while (validators.hasNext()) {
+                    OMElement validator = (OMElement) validators.next();
+                    if (validator != null) {
+                        scopeValidatorClazz = validator.getAttributeValue(new QName(ConfigElements.CLASS_ATTR));
+                        scopesToSkipAttr = validator.getAttributeValue(new QName(ConfigElements.SKIP_SCOPE_ATTR));
+                        prefix = validator.getAttributeValue(new QName(ConfigElements.PREFIX_ATTR));
+                        clazz = Thread.currentThread().getContextClassLoader().loadClass(scopeValidatorClazz);
+                        scopeValidator = (OAuth2ScopeValidator) clazz.newInstance();
+                        if (scopesToSkipAttr != null && !scopesToSkipAttr.isEmpty()) {
+                            //Split the scopes attr by a -space- character and create the set (avoid duplicates).
+                            scopesToSkip = new HashSet<>(Arrays.asList(scopesToSkipAttr.split(" ")));
+                            scopeValidator.setScopesToSkip(scopesToSkip);
+                        }
+                        if (prefix != null && !prefix.isEmpty()) {
+                            oAuth2ScopeValidators.put(prefix, scopeValidator);
+                        } else {
+                            if (log.isDebugEnabled()) {
+                                log.debug("Prefix of '" + scopeValidatorClazz + "' validator is not defined in the " +
+                                        "identity.xml, hence this will consider as the default validator");
+                            }
+                            oAuth2ScopeValidators.put(DEFAULT_PREFIX, scopeValidator);
+                        }
+                    }
+                }
+            } else {
+                if (log.isDebugEnabled()) {
+                    log.debug("\"ScopeValidator\" element was not available in identity.xml.");
+                }
             }
-            setoAuth2ScopeValidator(scopeValidator);
         } catch (ClassNotFoundException e) {
             log.error("Class not found in build path " + scopeValidatorClazz, e);
         } catch (InstantiationException e) {
             log.error("Class initialization error " + scopeValidatorClazz, e);
         } catch (IllegalAccessException e) {
             log.error("Class access error " + scopeValidatorClazz, e);
+        }
+    }
+
+    private void parseScopeIssuers(OMElement scopeIssuers) {
+        String clazzName = null;
+        String prefix;
+        Class clazz;
+        ScopesIssuer scopesIssuer;
+        try {
+            Iterator issuers = scopeIssuers.getChildrenWithLocalName(ConfigElements.SCOPES_ISSUER);
+            if (issuers != null) {
+                while (issuers.hasNext()) {
+                    OMElement issuer = (OMElement) issuers.next();
+                    if (issuer != null) {
+                        clazzName = issuer.getAttributeValue(new QName(ConfigElements.CLASS_ATTR));
+                        prefix = issuer.getAttributeValue(new QName(ConfigElements.PREFIX_ATTR));
+                        clazz = Thread.currentThread().getContextClassLoader().loadClass(clazzName);
+                        scopesIssuer = (ScopesIssuer) clazz.newInstance();
+                        if (prefix != null && !prefix.isEmpty()) {
+                            scopesIssuers.put(prefix, scopesIssuer);
+                        } else {
+                            if (log.isDebugEnabled()) {
+                                log.debug("Prefix of '" + clazzName + "' issuer is not defined in the identity.xml, " +
+                                        "hence this will consider as the default issuer");
+                            }
+                            scopesIssuers.put(DEFAULT_PREFIX, scopesIssuer);
+                        }
+                    }
+                }
+            } else {
+                if (log.isDebugEnabled()) {
+                    log.debug("\"ScopeIssuer\" element was not available in identity.xml.");
+                }
+            }
+        } catch (ClassNotFoundException e) {
+            log.error("Class not found in build path " + clazzName, e);
+        } catch (InstantiationException e) {
+            log.error("Class initialization error " + clazzName, e);
+        } catch (IllegalAccessException e) {
+            log.error("Class access error " + clazzName, e);
         }
     }
 
@@ -1564,12 +1642,12 @@ public class OAuthServerConfiguration {
         }
     }
 
-    public OAuth2ScopeValidator getoAuth2ScopeValidator() {
-        return oAuth2ScopeValidator;
+    public Map<String, OAuth2ScopeValidator> getOAuth2ScopeValidators() {
+        return oAuth2ScopeValidators;
     }
 
-    public void setoAuth2ScopeValidator(OAuth2ScopeValidator oAuth2ScopeValidator) {
-        this.oAuth2ScopeValidator = oAuth2ScopeValidator;
+    public Map<String, ScopesIssuer> getOAuth2ScopesIssuers() {
+        return scopesIssuers;
     }
 
     /**
@@ -1633,8 +1711,13 @@ public class OAuthServerConfiguration {
         private static final String TOKEN_VALIDATOR = "TokenValidator";
         private static final String TOKEN_TYPE_ATTR = "type";
         private static final String TOKEN_CLASS_ATTR = "class";
+        private static final String CLASS_ATTR = "class";
+        private static final String SCOPE_VALIDATORS = "OAuthScopeValidators";
         private static final String SCOPE_VALIDATOR = "OAuthScopeValidator";
-        private static final String SCOPE_CLASS_ATTR = "class";
+        private static final String SCOPES_ISSUERS = "OAuthScopesIssuers";
+        private static final String SCOPES_ISSUER = "OAuthScopeIssuer";
+        private static final String PREFIX_ATTR = "prefix";
+        private static final String SCOPE_VALIDATION_DELEGATOR = "OAuthScopeValidationDelegator";
         private static final String SKIP_SCOPE_ATTR = "scopesToSkip";
         private static final String IMPLICIT_ERROR_FRAGMENT = "ImplicitErrorFragment";
 
